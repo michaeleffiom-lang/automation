@@ -1,0 +1,21 @@
+{
+  "clients": {
+    "cliente-a": {
+      "base_url": "https://127.0.0.1:18443",
+      "service_discovery_url": "https://127.0.0.1:18443/prometheus/service-discovery",
+      "auth": {
+        "username_env": "PMM_CLIENTE_A_USERNAME",
+        "password_env": "PMM_CLIENTE_A_PASSWORD"
+      },
+      "tls_insecure": true,
+      "timeout": 10
+    },
+    "cliente-b": {
+      "base_url": "https://127.0.0.1:28443",
+      "auth": {
+        "token_env": "PMM_CLIENTE_B_TOKEN"
+      },
+      "tls_insecure": false
+    }
+  }
+}
