@@ -1,0 +1,228 @@
+services:
+  pmm-server-2:
+    image: docker.io/percona/pmm-server:3
+    container_name: pmm-server-2
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8443:8443"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${PMM_ADMIN_USERNAME:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${PMM_ADMIN_PASSWORD:-change-me}
+      PMM_ENABLE_UPDATES: "0"
+    volumes:
+      - pmm-server-mcp-data:/srv
+    networks:
+      - mcp-pmm-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -kfsS https://127.0.0.1:8443/graph/api/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+  mongodb7-rs1:
+    image: docker.io/library/mongo:7.0
+    container_name: mongodb7-rs1
+    restart: unless-stopped
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all", "--keyFile", "/etc/mongo-keyfile"]
+    ports:
+      - "127.0.0.1:27018:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+    volumes:
+      - mongodb7-rs1-data:/data/db
+      - ./.pmm-cache/mongodb-keyfile:/etc/mongo-keyfile:ro
+    networks:
+      - mcp-pmm-net
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --host 127.0.0.1 --username $$MONGO_INITDB_ROOT_USERNAME --password $$MONGO_INITDB_ROOT_PASSWORD --authenticationDatabase admin --eval 'db.adminCommand({ ping: 1 }).ok' | grep 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  mongodb7-rs2:
+    image: docker.io/library/mongo:7.0
+    container_name: mongodb7-rs2
+    restart: unless-stopped
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all", "--keyFile", "/etc/mongo-keyfile"]
+    ports:
+      - "127.0.0.1:27019:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+    volumes:
+      - mongodb7-rs2-data:/data/db
+      - ./.pmm-cache/mongodb-keyfile:/etc/mongo-keyfile:ro
+    networks:
+      - mcp-pmm-net
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --host 127.0.0.1 --username $$MONGO_INITDB_ROOT_USERNAME --password $$MONGO_INITDB_ROOT_PASSWORD --authenticationDatabase admin --eval 'db.adminCommand({ ping: 1 }).ok' | grep 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  mongodb7-rs3:
+    image: docker.io/library/mongo:7.0
+    container_name: mongodb7-rs3
+    restart: unless-stopped
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all", "--keyFile", "/etc/mongo-keyfile"]
+    ports:
+      - "127.0.0.1:27020:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+    volumes:
+      - mongodb7-rs3-data:/data/db
+      - ./.pmm-cache/mongodb-keyfile:/etc/mongo-keyfile:ro
+    networks:
+      - mcp-pmm-net
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --host 127.0.0.1 --username $$MONGO_INITDB_ROOT_USERNAME --password $$MONGO_INITDB_ROOT_PASSWORD --authenticationDatabase admin --eval 'db.adminCommand({ ping: 1 }).ok' | grep 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  mongodb7-rs-init:
+    image: docker.io/library/mongo:7.0
+    container_name: mongodb7-rs-init
+    environment:
+      MONGO_ROOT_USERNAME: ${MONGO_ROOT_USERNAME}
+      MONGO_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+    depends_on:
+      mongodb7-rs1:
+        condition: service_healthy
+      mongodb7-rs2:
+        condition: service_healthy
+      mongodb7-rs3:
+        condition: service_healthy
+    volumes:
+      - ./scripts/init-replica-set.sh:/opt/pmm/init-replica-set.sh:ro
+    entrypoint: ["/bin/sh", "/opt/pmm/init-replica-set.sh"]
+    networks:
+      - mcp-pmm-net
+
+  pmm-client-mcp:
+    image: docker.io/percona/pmm-client:3
+    container_name: pmm-client-mcp
+    restart: unless-stopped
+    depends_on:
+      pmm-server-2:
+        condition: service_healthy
+      mongodb7-rs1:
+        condition: service_healthy
+      mongodb7-rs-init:
+        condition: service_completed_successfully
+    environment:
+      PMM_AGENT_SETUP: "1"
+      PMM_AGENT_SETUP_FORCE: "1"
+      PMM_AGENT_SETUP_NODE_NAME: mongodb7-rs1
+      PMM_AGENT_SETUP_NODE_TYPE: container
+      PMM_AGENT_SERVER_ADDRESS: pmm-server-2:8443
+      PMM_AGENT_SERVER_USERNAME: ${PMM_ADMIN_USERNAME}
+      PMM_AGENT_SERVER_PASSWORD: ${PMM_ADMIN_PASSWORD}
+      PMM_AGENT_SERVER_INSECURE_TLS: "1"
+      PMM_AGENT_CONFIG_FILE: config/pmm-agent.yaml
+      PMM_AGENT_PRERUN_SCRIPT: /opt/percona/pmm-prerun.sh
+      MONGO_ROOT_USERNAME: ${MONGO_ROOT_USERNAME}
+      MONGO_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+      PMM_MONGODB_SERVICE_NAME: mflix-rs
+      PMM_MONGODB_SERVICE_ADDRESS: mongodb7-rs1:27017
+      PMM_MONGODB_REPLICATION_SET: rs0
+      PMM_MONGODB_CLUSTER: mflix-lab
+    volumes:
+      - pmm-client-mcp-data:/usr/local/percona/pmm
+      - ./pmm-prerun.sh:/opt/percona/pmm-prerun.sh:ro
+    networks:
+      - mcp-pmm-net
+
+  pmm-client-mcp-rs2:
+    image: docker.io/percona/pmm-client:3
+    container_name: pmm-client-mcp-rs2
+    restart: unless-stopped
+    depends_on:
+      pmm-server-2:
+        condition: service_healthy
+      mongodb7-rs2:
+        condition: service_healthy
+      mongodb7-rs-init:
+        condition: service_completed_successfully
+    environment:
+      PMM_AGENT_SETUP: "1"
+      PMM_AGENT_SETUP_FORCE: "1"
+      PMM_AGENT_SETUP_NODE_NAME: mongodb7-rs2
+      PMM_AGENT_SETUP_NODE_TYPE: container
+      PMM_AGENT_SERVER_ADDRESS: pmm-server-2:8443
+      PMM_AGENT_SERVER_USERNAME: ${PMM_ADMIN_USERNAME}
+      PMM_AGENT_SERVER_PASSWORD: ${PMM_ADMIN_PASSWORD}
+      PMM_AGENT_SERVER_INSECURE_TLS: "1"
+      PMM_AGENT_CONFIG_FILE: config/pmm-agent.yaml
+      PMM_AGENT_PRERUN_SCRIPT: /opt/percona/pmm-prerun.sh
+      MONGO_ROOT_USERNAME: ${MONGO_ROOT_USERNAME}
+      MONGO_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+      PMM_MONGODB_SERVICE_NAME: mflix-rs2
+      PMM_MONGODB_SERVICE_ADDRESS: mongodb7-rs2:27017
+      PMM_MONGODB_REPLICATION_SET: rs0
+      PMM_MONGODB_CLUSTER: mflix-lab
+    volumes:
+      - pmm-client-mcp-rs2-data:/usr/local/percona/pmm
+      - ./pmm-prerun.sh:/opt/percona/pmm-prerun.sh:ro
+    networks:
+      - mcp-pmm-net
+
+  pmm-client-mcp-rs3:
+    image: docker.io/percona/pmm-client:3
+    container_name: pmm-client-mcp-rs3
+    restart: unless-stopped
+    depends_on:
+      pmm-server-2:
+        condition: service_healthy
+      mongodb7-rs3:
+        condition: service_healthy
+      mongodb7-rs-init:
+        condition: service_completed_successfully
+    environment:
+      PMM_AGENT_SETUP: "1"
+      PMM_AGENT_SETUP_FORCE: "1"
+      PMM_AGENT_SETUP_NODE_NAME: mongodb7-rs3
+      PMM_AGENT_SETUP_NODE_TYPE: container
+      PMM_AGENT_SERVER_ADDRESS: pmm-server-2:8443
+      PMM_AGENT_SERVER_USERNAME: ${PMM_ADMIN_USERNAME}
+      PMM_AGENT_SERVER_PASSWORD: ${PMM_ADMIN_PASSWORD}
+      PMM_AGENT_SERVER_INSECURE_TLS: "1"
+      PMM_AGENT_CONFIG_FILE: config/pmm-agent.yaml
+      PMM_AGENT_PRERUN_SCRIPT: /opt/percona/pmm-prerun.sh
+      MONGO_ROOT_USERNAME: ${MONGO_ROOT_USERNAME}
+      MONGO_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+      PMM_MONGODB_SERVICE_NAME: mflix-rs3
+      PMM_MONGODB_SERVICE_ADDRESS: mongodb7-rs3:27017
+      PMM_MONGODB_REPLICATION_SET: rs0
+      PMM_MONGODB_CLUSTER: mflix-lab
+    volumes:
+      - pmm-client-mcp-rs3-data:/usr/local/percona/pmm
+      - ./pmm-prerun.sh:/opt/percona/pmm-prerun.sh:ro
+    networks:
+      - mcp-pmm-net
+
+volumes:
+  pmm-server-mcp-data:
+    name: pmm-server-mcp-data
+  mongodb7-rs1-data:
+    name: mongodb7-rs1-data
+  mongodb7-rs2-data:
+    name: mongodb7-rs2-data
+  mongodb7-rs3-data:
+    name: mongodb7-rs3-data
+  pmm-client-mcp-data:
+    name: pmm-client-mcp-data
+  pmm-client-mcp-rs2-data:
+    name: pmm-client-mcp-rs2-data
+  pmm-client-mcp-rs3-data:
+    name: pmm-client-mcp-rs3-data
+
+networks:
+  mcp-pmm-net:
+    name: mcp-pmm-net

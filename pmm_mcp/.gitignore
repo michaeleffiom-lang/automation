@@ -1,0 +1,7 @@
+.env
+clients.json
+.venv/
+__pycache__/
+*.py[cod]
+.pmm-cache/
+mcp-client.local.json
