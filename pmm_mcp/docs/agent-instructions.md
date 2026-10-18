@@ -18,10 +18,13 @@ Definição portátil do agente que utiliza este MCP:
 1. Instale e configure o servidor conforme o [README](../README.md#executar).
 2. No cliente compatível com MCP, crie um agente chamado **PMM Operations** e associe o servidor `pmm-operations`.
 3. Copie o conteúdo integral de `PROMPT.md` para o campo de instruções do agente. Se o cliente suportar instruções por arquivo, aponte para esse arquivo.
-4. Inicie a conversa com `use pmm mcp: liste os MongoDB do cliente`.
-5. Depois de atualizar o repositório, recarregue o arquivo ou copie novamente o prompt para o cliente.
+4. Se o cliente oferecer suporte a Agent Skills, registre também `skills/mongodb-workload-analysis/`; o prompt continua sendo a fonte operacional portátil.
+5. Inicie a conversa com `use pmm mcp: liste os MongoDB do cliente`.
+6. Depois de atualizar o repositório, recarregue o prompt e a skill no cliente.
 
 For a periodic performance assessment, confirm the environment and use `generate_performance_reports`. The tool collects available PMM series by cluster/replica set and returns a structured assessment; it does not replace the standard `health_check`, and missing metrics must not be interpreted as normal conditions. Before delivering the result, review `consistency_check`. The tool queries `mongodb_mongod_replset_my_state` when available, checks role-state coverage and the single-primary invariant, and flags missing or conflicting states. Treat role data as a point-in-time observation, not as a health declaration or election history. All reports and documents produced by the agent must be written in English, even when the conversation is in Portuguese.
+
+The v1.1 workload-analysis skill under `skills/mongodb-workload-analysis/` applies only when using `generate_performance_reports` or writing a customer report from that result. It does not replace instructions for discovery, health checks, or ad hoc PromQL. The report builder attaches `report_validation` to every generated report; this checks required structure while preserving role consistency warnings. Use the JSON validator on structured output and the Markdown validator on a report draft. Structural errors must be resolved; telemetry warnings must remain explicit in the report. The skill’s default tool window is the MCP generator’s seven days; do not imply QAN or other data sources unless they were returned.
 
 When the user requests a Google Docs deliverable, use `generate_performance_reports` for PMM data and the connected Google Drive/Docs tools to create a new native Google Doc for that request. Every new report must be a separate file; never overwrite, reuse, or edit the current or a previous report to deliver a new report. Follow a referenced prior report's format, and include the date, period, environment, available metrics, telemetry gaps, and limitations. Copy the visual template to a new file, preserve the source template and all previous reports, and use a unique title containing the cluster and date/time. `generate_performance_reports` returns structured PMM data; Google Docs creation is provided by the separate Drive connector.
 

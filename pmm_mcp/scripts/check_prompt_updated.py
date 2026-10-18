@@ -5,8 +5,8 @@ import subprocess
 from pathlib import Path
 
 
-def git(*args: str) -> str:
-    return subprocess.check_output(['git', *args], text=True).strip()
+def git(*args: str, cwd: Path | None = None) -> str:
+    return subprocess.check_output(['git', *args], cwd=cwd, text=True).strip()
 
 
 def main() -> int:
@@ -14,21 +14,39 @@ def main() -> int:
     parser.add_argument('base', help='Base commit; all zeros means a new branch')
     parser.add_argument('head', nargs='?', help='Final commit; omit to check local files')
     args = parser.parse_args()
+    repo_root = Path(git('rev-parse', '--show-toplevel')).resolve()
+    project_root = Path(__file__).resolve().parent.parent
+    try:
+        project_path = project_root.relative_to(repo_root)
+    except ValueError as exc:
+        raise SystemExit(f'Prompt checker must be inside its Git working tree: {exc}')
+    prompt_path = (project_path / 'PROMPT.md').as_posix()
+    prefix = '' if project_path == Path('.') else project_path.as_posix().rstrip('/') + '/'
+
+    def project_files(paths: set[str]) -> set[str]:
+        if not prefix:
+            return paths
+        return {path[len(prefix):] for path in paths if path.startswith(prefix)}
+
     base = args.base
     if base and set(base) == {'0'}:
         base = subprocess.check_output(
-            ['git', 'hash-object', '-t', 'tree', '--stdin'], input='', text=True
+            ['git', 'hash-object', '-t', 'tree', '--stdin'],
+            cwd=repo_root,
+            input='',
+            text=True,
         ).strip()
     revisions = [base, args.head] if args.head else [base]
-    changed = set(git('diff', '--no-renames', '--name-only', '-z', *revisions).split('\0')) - {''}
+    changed = set(git('diff', '--no-renames', '--name-only', '-z', *revisions, cwd=repo_root).split('\0')) - {''}
     if not args.head:
-        changed.update(git('ls-files', '--others', '--exclude-standard', '-z').split('\0'))
+        changed.update(git('ls-files', '--others', '--exclude-standard', '-z', cwd=repo_root).split('\0'))
         changed.discard('')
+    changed = project_files(changed)
     if args.head:
-        prompt = git('show', f'{args.head}:PROMPT.md')
+        prompt = git('show', f'{args.head}:{prompt_path}', cwd=repo_root)
     else:
-        root = Path(git('rev-parse', '--show-toplevel'))
-        prompt = (root / 'PROMPT.md').read_text() if (root / 'PROMPT.md').exists() else ''
+        prompt_file = project_root / 'PROMPT.md'
+        prompt = prompt_file.read_text() if prompt_file.exists() else ''
     if not prompt.strip():
         print('ERRO: PROMPT.md deve existir e conter as instruções do agente.')
         return 1

@@ -10,6 +10,7 @@ from pmm_mcp.performance_report import (
 )
 from pmm_mcp.workload_comparison import compare_summaries, summarize_range_result
 from pmm_mcp.server import _report_role_query, _report_selector
+from pmm_mcp.report_validation import validate_performance_report
 
 
 class PromQLTests(unittest.TestCase):
@@ -65,6 +66,8 @@ class PromQLTests(unittest.TestCase):
             },
         )
         self.assertEqual(report["title"], "Percona Managed Services Assessment")
+        self.assertEqual(report["report_validation"]["status"], "warning")
+        self.assertTrue(report["consistency_check"]["warnings"])
         self.assertEqual(len(report["executive_summary"]["findings"]), 1)
         self.assertIn("root_filesystem_used_percent", report["executive_summary"]["unavailable_metric_families"])
 
@@ -112,6 +115,21 @@ class PromQLTests(unittest.TestCase):
         )
         self.assertEqual(report["consistency_check"]["status"], "passed")
         self.assertEqual(report["consistency_check"]["checks"]["single_primary"], "passed")
+        self.assertEqual(report["report_validation"]["status"], "passed")
+
+    def test_report_validator_rejects_missing_consistency_and_topology_members(self) -> None:
+        result = validate_performance_report({
+            "report_type": "mongodb_cluster_performance_review",
+            "title": "Assessment",
+            "scope": {"cluster": "orders", "replica_set": "rs0", "member_count": 1},
+            "executive_summary": {},
+            "topology": {"members": []},
+            "sections": {},
+            "limitations": [],
+        })
+        self.assertEqual(result["status"], "invalid")
+        self.assertTrue(any("consistency_check" in error for error in result["errors"]))
+        self.assertTrue(any("member_count" in error for error in result["errors"]))
 
     def test_role_consistency_check_flags_missing_and_multiple_primary_states(self) -> None:
         members = [{"service_name": "one"}, {"service_name": "two"}]

@@ -11,6 +11,8 @@ import math
 from datetime import UTC, datetime
 from typing import Any
 
+from pmm_mcp.report_validation import check_report_consistency, validate_performance_report
+
 
 def _number(value: object) -> float | None:
     try:
@@ -164,65 +166,6 @@ def summarize_member_role_series(
     return summary
 
 
-def check_report_consistency(
-    members: list[dict[str, Any]],
-    role_summary: dict[str, dict[str, object]],
-    role_metric_available: bool,
-) -> dict[str, object]:
-    """Check report role coverage and the single-primary replica-set invariant."""
-
-    names = [str(member.get("service_name", "")) for member in members if member.get("service_name")]
-    observed = {
-        name: role_summary.get(name, {})
-        for name in names
-    }
-    complete = bool(names) and all(
-        item.get("status") == "ok" and item.get("role_state") != "unknown"
-        for item in observed.values()
-    )
-    warnings: list[str] = []
-    if not role_metric_available:
-        coverage_status = "unavailable"
-        primary_status = "not_checked"
-        warnings.append("Replica-set member roles could not be checked because mongodb_mongod_replset_my_state is unavailable.")
-    else:
-        missing = [name for name, item in observed.items() if item.get("status") != "ok"]
-        if missing:
-            coverage_status = "warning"
-            warnings.append("Role-state telemetry is missing or conflicting for: " + ", ".join(missing) + ".")
-        else:
-            coverage_status = "passed"
-
-        timestamps = [
-            _number(item.get("observed_at_epoch"))
-            for item in observed.values()
-            if item.get("observed_at_epoch") is not None
-        ]
-        # Prometheus instant vectors may use slightly different scrape times.
-        synchronized = bool(names) and len(timestamps) == len(names) and max(timestamps) - min(timestamps) <= 60
-        if not complete or not synchronized:
-            primary_status = "not_checked"
-            if complete and not synchronized:
-                warnings.append("Role-state samples are more than 60 seconds apart; primary-count consistency was not evaluated.")
-        else:
-            primary_count = sum(item.get("role_state") == "primary" for item in observed.values())
-            primary_status = "passed" if primary_count == 1 else "warning"
-            if primary_count != 1:
-                warnings.append(f"Role-state telemetry reports {primary_count} primary members; expected exactly one.")
-
-    return {
-        "status": "not_available" if not role_metric_available else "warning" if warnings else "passed",
-        "role_metric": "mongodb_mongod_replset_my_state",
-        "member_count": len(names),
-        "members_with_role": sum(item.get("status") == "ok" for item in observed.values()),
-        "checks": {
-            "role_state_coverage": coverage_status,
-            "single_primary": primary_status,
-        },
-        "warnings": warnings,
-    }
-
-
 def make_assessment(
     members: list[dict[str, Any]], metrics: dict[str, dict[str, dict[str, object]]],
     thresholds: dict[str, float],
@@ -303,7 +246,7 @@ def build_replica_set_report(
     topology_summary = f"Replica set {replica_set} contains {len(members)} inventoried member(s)."
     if role_metric_available and consistency["checks"]["single_primary"] == "passed":
         topology_summary += f" The PMM role-state snapshot shows one primary and {secondary_count} secondary member(s)."
-    return {
+    report = {
         "report_type": "mongodb_cluster_performance_review",
         "title": "Percona Managed Services Assessment",
         "scope": {"cluster": cluster, "replica_set": replica_set, "member_count": len(members)},
@@ -332,3 +275,5 @@ def build_replica_set_report(
             "Replica-set member states are point-in-time PMM observations and do not provide a history of elections or role changes.",
         ],
     }
+    report["report_validation"] = validate_performance_report(report)
+    return report

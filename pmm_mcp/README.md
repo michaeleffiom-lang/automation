@@ -10,6 +10,7 @@ Em um repositório privado, cada usuário precisa receber acesso pelo GitHub ant
 - [INSTALL.md](INSTALL.md): instalação usando `git` ou `gh`, configuração e atualização.
 - [PROMPT.md](PROMPT.md): prompt completo para copiar para o cliente de chat.
 - [Definição do agente](docs/agent-instructions.md): configuração do agente PMM Operations.
+- [Skill MongoDB Workload Analysis v1.1](skills/mongodb-workload-analysis/SKILL.md): metodologia e evidência aplicadas somente ao fluxo `generate_performance_reports`, com template e validadores.
 - [CONTRIBUTING.md](CONTRIBUTING.md): atualização obrigatória do prompt e validação.
 
 O MCP descobre os serviços pelo inventário do PMM configurado por cada usuário. Não inclui acesso a uma instância PMM nem configurações reais de clientes.
@@ -158,6 +159,8 @@ Gere a avaliação de performance dos últimos sete dias para todos os replica s
 ```
 
 O agente deve confirmar o ambiente, explicar que investigará recursos, armazenamento, conexões e replicação com PromQL somente leitura e chamar `generate_performance_reports`. O resultado é estruturado para uma revisão Percona Managed Services; ele não gera um PDF, não inclui histórico de alertas e não substitui o `health_check` corporativo. Revise `consistency_check` e apresente papéis ausentes ou conflitantes como limitações, nunca como condição saudável.
+
+O pacote `skills/mongodb-workload-analysis/` aplica a metodologia v1.1 somente ao fluxo `generate_performance_reports`; ela não altera health checks, descoberta nem consultas ad hoc. Inclui regras de evidência, referências, template Markdown e dois validadores: `scripts/validate-report.py` para JSON estruturado e `scripts/validate_report.py` para o rascunho Markdown. O servidor também anexa `report_validation` e `consistency_check` nas avaliações. Registre a skill no cliente de chat quando houver suporte a Agent Skills; `PROMPT.md` mantém as instruções essenciais. Os validadores verificam estrutura e referências de evidência, não a veracidade da análise.
 
 ```
 
