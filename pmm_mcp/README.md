@@ -161,7 +161,7 @@ O agente deve confirmar o ambiente, explicar que investigará recursos, armazena
 
 ```
 
-Se o cliente de chat também tiver o conector Google Drive/Docs, você pode pedir para salvar a avaliação em um Google Doc. O agente usa `generate_performance_reports` para coletar os dados e o conector Drive/Docs separado para criar o documento nativo. O relatório completo `Percona Managed Services Assessment — mflix-lab rs0 — 7-Day Review — 2026-10-15` é o modelo visual padrão para novos relatórios; o agente faz uma cópia e preserva sua estrutura e formatação.
+Se o cliente de chat também tiver o conector Google Drive/Docs, você pode pedir para salvar a avaliação em um Google Doc. O agente usa `generate_performance_reports` para coletar os dados e o conector Drive/Docs separado para criar o documento nativo. Cada solicitação cria um arquivo novo com nome exclusivo contendo cluster e data/hora; relatórios atuais e anteriores nunca são sobrescritos ou reutilizados como destino. O relatório completo `Percona Managed Services Assessment — mflix-lab rs0 — 7-Day Review — 2026-10-15` é o modelo visual padrão; o agente copia o modelo, preserva sua estrutura e formatação e mantém o arquivo original intacto.
 
 ## Clientes PMM
 
