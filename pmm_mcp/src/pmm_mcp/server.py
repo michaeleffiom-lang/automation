@@ -54,21 +54,41 @@ _REPORT_THRESHOLDS = {
 }
 
 
+def _report_label_selector(label: str, values: list[str]) -> str:
+    """Build a bounded PromQL matcher for values from PMM inventory."""
+
+    # Hyphen is literal outside a character class; Python's re.escape emits
+    # ``\\-`` which RE2 rejects in this context.
+    escaped = "|".join(
+        re.sub(r"([\\.^$|?*+()\[\]{}])", r"\\\1", value)
+        for value in values if value
+    )
+    # Prometheus uses RE2, which does not support Python's ``(?:...)`` group.
+    return f'{label}=~"^({escaped})$"' if escaped else ""
+
+
 def _report_selector(service_names: list[str]) -> str:
     """Build a bounded PromQL matcher for inventory service names."""
+    return _report_label_selector("service_name", service_names)
 
-    def escape_re2(value: str) -> str:
-        # Hyphen is literal outside a character class; Python's re.escape emits
-        # ``\\-`` which RE2 rejects in this context.
-        return re.sub(r"([\\.^$|?*+()\[\]{}])", r"\\\1", value)
 
-    escaped = "|".join(escape_re2(name) for name in service_names if name)
-    # Prometheus uses RE2, which does not support Python's ``(?:...)`` group.
-    return f'service_name=~"^({escaped})$"' if escaped else ""
+def _report_node_selector(members: list[dict[str, Any]]) -> tuple[str, str]:
+    """Choose the host label that connects node-exporter metrics to inventory."""
+    node_ids = [str(member.get("node_id", "")) for member in members]
+    if node_ids and all(node_ids):
+        return "node_id", _report_label_selector("node_id", node_ids)
+
+    node_names = [
+        str(member.get("node_name") or member.get("address") or "")
+        for member in members
+    ]
+    if node_names and all(node_names):
+        return "node_name", _report_label_selector("node_name", node_names)
+    return "", ""
 
 
 def _report_metric_query(
-    available_metrics: set[str], metric: str, service_names: list[str]
+    available_metrics: set[str], metric: str, members: list[dict[str, Any]]
 ) -> tuple[str | None, str | None]:
     """Choose a known PMM metric and the report expression for it.
 
@@ -77,15 +97,21 @@ def _report_metric_query(
     guessed identifier and interpreting the empty result as normal operation.
     """
 
+    service_names = [str(member.get("service_name", "")) for member in members]
     selector = _report_selector(service_names)
+    node_label, node_selector = _report_node_selector(members)
     definitions = {
         "cpu_used_percent": (
             ("node_cpu_seconds_total",),
-            lambda names: f'100 * (1 - avg by (service_name) (rate({names[0]}{{mode="idle",{selector}}}[5m])))',
+            lambda names: f'100 * (1 - avg by ({node_label}) (rate({names[0]}{{mode="idle",{node_selector}}}[5m])))',
         ),
         "root_filesystem_used_percent": (
             ("node_filesystem_avail_bytes", "node_filesystem_size_bytes"),
-            lambda names: f'100 * (1 - {names[0]}{{mountpoint="/",{selector}}} / {names[1]}{{mountpoint="/",{selector}}})',
+            lambda names: (
+                f'100 * (1 - max by ({node_label}) '
+                f'({names[0]}{{mountpoint="/",{node_selector}}}) / '
+                f'max by ({node_label}) ({names[1]}{{mountpoint="/",{node_selector}}}))'
+            ),
         ),
         "connection_used_percent": (
             ("mongodb_connections",),
@@ -96,8 +122,14 @@ def _report_metric_query(
             ),
         ),
         "wiredtiger_dirty_page_percent": (
-            ("mongodb_wiredtiger_cache_pages_dirty", "mongodb_wiredtiger_cache_pages_total"),
-            lambda names: f'100 * {names[0]}{{{selector}}} / {names[1]}{{{selector}}}',
+            (
+                "mongodb_ss_wt_cache_tracked_dirty_bytes_in_the_cache",
+                "mongodb_mongod_wiredtiger_cache_max_bytes",
+            ),
+            lambda names: (
+                f'100 * max by (service_name) ({names[0]}{{{selector}}}) / '
+                f'max by (service_name) ({names[1]}{{{selector}}})'
+            ),
         ),
         "replication_lag_seconds": (
             ("mongodb_mongod_replset_member_replication_lag",),
@@ -109,9 +141,10 @@ def _report_metric_query(
         ),
     }
     candidates, expression = definitions[metric]
-    if not selector or not all(candidate in available_metrics for candidate in candidates):
+    query_selector = node_selector if metric in {"cpu_used_percent", "root_filesystem_used_percent"} else selector
+    if not query_selector or not all(candidate in available_metrics for candidate in candidates):
         return None, None
-    return candidates[0], expression(candidates)
+    return " / ".join(candidates), expression(candidates)
 
 
 def _report_role_query(
@@ -752,7 +785,7 @@ def generate_performance_reports(
             "replication_lag_seconds": 0.0,
             "operations_per_second": 0.0,
         }:
-            source, query = _report_metric_query(available_metrics, metric, service_names)
+            source, query = _report_metric_query(available_metrics, metric, members)
             metric_sources[metric] = source
             if query is None:
                 metric_summaries[metric] = {

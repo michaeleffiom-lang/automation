@@ -9,7 +9,7 @@ from pmm_mcp.performance_report import (
     summarize_member_role_series,
 )
 from pmm_mcp.workload_comparison import compare_summaries, summarize_range_result
-from pmm_mcp.server import _report_role_query, _report_selector
+from pmm_mcp.server import _report_metric_query, _report_role_query, _report_selector
 from pmm_mcp.report_validation import validate_performance_report
 
 
@@ -75,6 +75,66 @@ class PromQLTests(unittest.TestCase):
         selector = _report_selector(["mflix-rs", "mongodb7-mcp"])
         self.assertIn("^(mflix-rs|mongodb7-mcp)$", selector)
         self.assertNotIn("?:", selector)
+
+    def test_host_metric_queries_join_node_exporter_by_inventory_node_id(self) -> None:
+        members = [
+            {"service_name": "mflix-rs", "node_id": "node-1", "address": "mongodb7-rs1"},
+            {"service_name": "mflix-rs2", "node_id": "node-2", "address": "mongodb7-rs2"},
+        ]
+        cpu_source, cpu_query = _report_metric_query(
+            {"node_cpu_seconds_total"}, "cpu_used_percent", members
+        )
+        filesystem_source, filesystem_query = _report_metric_query(
+            {"node_filesystem_avail_bytes", "node_filesystem_size_bytes"},
+            "root_filesystem_used_percent",
+            members,
+        )
+        self.assertEqual(cpu_source, "node_cpu_seconds_total")
+        self.assertIn('node_id=~"^(node-1|node-2)$"', cpu_query)
+        self.assertIn("avg by (node_id)", cpu_query)
+        self.assertNotIn("service_name", cpu_query)
+        validate_promql(cpu_query)
+        self.assertIn("mountpoint=\"/\"", filesystem_query)
+        self.assertIn("max by (node_id)", filesystem_query)
+        self.assertIn("node_id=~\"^(node-1|node-2)$\"", filesystem_query)
+        self.assertIn("node_filesystem_avail_bytes / node_filesystem_size_bytes", filesystem_source)
+        validate_promql(filesystem_query)
+
+    def test_wiredtiger_dirty_percentage_uses_available_server_status_metrics(self) -> None:
+        members = [{"service_name": "mflix-rs", "node_id": "node-1"}]
+        source, query = _report_metric_query(
+            {
+                "mongodb_ss_wt_cache_tracked_dirty_bytes_in_the_cache",
+                "mongodb_mongod_wiredtiger_cache_max_bytes",
+            },
+            "wiredtiger_dirty_page_percent",
+            members,
+        )
+        self.assertEqual(
+            source,
+            "mongodb_ss_wt_cache_tracked_dirty_bytes_in_the_cache / "
+            "mongodb_mongod_wiredtiger_cache_max_bytes",
+        )
+        self.assertIn("100 * max by (service_name)", query)
+        self.assertIn("mongodb_ss_wt_cache_tracked_dirty_bytes_in_the_cache", query)
+        self.assertIn("mongodb_mongod_wiredtiger_cache_max_bytes", query)
+        validate_promql(query)
+
+    def test_member_summarizer_maps_node_exporter_series_to_service_by_node_id(self) -> None:
+        members = [
+            {"service_name": "mflix-rs", "node_id": "node-1"},
+            {"service_name": "mflix-rs2", "node_id": "node-2"},
+        ]
+        summary = summarize_member_series(
+            {"data": {"result": [
+                {"metric": {"node_id": "node-1", "node_name": "mongodb7-rs1"}, "values": [[1, "20"], [2, "30"]]},
+                {"metric": {"node_id": "node-2", "node_name": "mongodb7-rs2"}, "values": [[1, "40"]]},
+            ]}},
+            members,
+        )
+        self.assertEqual(summary["mflix-rs"]["maximum"], 30.0)
+        self.assertEqual(summary["mflix-rs"]["samples"], 2)
+        self.assertEqual(summary["mflix-rs2"]["latest"], 40.0)
 
     def test_performance_report_queries_member_role_metric_when_available(self) -> None:
         source, query = _report_role_query(

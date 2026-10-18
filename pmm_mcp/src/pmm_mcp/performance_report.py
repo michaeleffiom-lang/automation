@@ -47,6 +47,16 @@ def summarize_member_series(
         for name in known
         if name
     }
+    node_id_to_service = {
+        str(member.get("node_id")): str(member.get("service_name"))
+        for member in members
+        if member.get("node_id") and member.get("service_name")
+    }
+    node_name_to_service = {
+        str(member.get("node_name") or member.get("address")): str(member.get("service_name"))
+        for member in members
+        if (member.get("node_name") or member.get("address")) and member.get("service_name")
+    }
     data = result.get("data", {})
     series = data.get("result", []) if isinstance(data, dict) else []
     if not isinstance(series, list):
@@ -58,7 +68,11 @@ def summarize_member_series(
         labels = item.get("metric", {})
         if not isinstance(labels, dict):
             continue
-        name = str(labels.get("service_name") or labels.get("node_name") or "")
+        name = str(labels.get("service_name") or "")
+        if name not in summary:
+            name = node_id_to_service.get(str(labels.get("node_id", "")), "")
+        if not name:
+            name = node_name_to_service.get(str(labels.get("node_name", "")), "")
         if name not in summary:
             continue
         for point in item.get("values", []):
