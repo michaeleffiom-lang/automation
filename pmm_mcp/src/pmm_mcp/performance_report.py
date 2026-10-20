@@ -653,7 +653,7 @@ def detect_member_workload_peaks(
     }
     data = result.get("data", {})
     series = data.get("result", []) if isinstance(data, dict) else []
-    collected: dict[str, list[tuple[float, float]]] = {}
+    collected: dict[str, list[dict[str, Any]]] = {}
     if not isinstance(series, list):
         return []
     for item in series:
@@ -674,10 +674,29 @@ def detect_member_workload_peaks(
                 continue
             timestamp, value = _number(point[0]), _number(point[1])
             if timestamp is not None and value is not None:
-                collected.setdefault(name, []).append((timestamp, value))
+                collected.setdefault(name, []).append({
+                    "timestamp_epoch": timestamp,
+                    "value": value,
+                    "labels": dict(labels),
+                    "source_matches_inventory_node_id": bool(
+                        labels.get("node_id")
+                        and str(labels.get("node_id")) == str(
+                            next((member.get("node_id") for member in members
+                                  if str(member.get("service_name", "")) == name), "")
+                        )
+                    ),
+                })
 
     peaks: list[dict[str, object]] = []
-    for name, points in collected.items():
+    for name, rows in collected.items():
+        # Historical exporter re-registration can leave several label sets for
+        # one PMM service. Use the same provenance-aware timestamp selection as
+        # report summaries so overlapping old/new series cannot inflate a mean
+        # or occupy multiple peak candidates.
+        points = [
+            (float(row["timestamp_epoch"]), float(row["value"]))
+            for row in _select_timestamp_observations(rows, "operations_per_second")
+        ]
         if len(points) < minimum_samples:
             continue
         points.sort()
@@ -707,6 +726,75 @@ def detect_member_workload_peaks(
                           "significant": significant})
     peaks.sort(key=lambda peak: (float(peak["value"]), float(peak["timestamp"])), reverse=True)
     return peaks
+
+
+def refine_workload_peak_timestamps(
+    peaks: list[dict[str, object]],
+    detailed_observations: dict[str, list[dict[str, Any]]],
+    detection_window_seconds: float,
+) -> list[dict[str, object]]:
+    """Replace coarse discovery timestamps with matching finer observations.
+
+    A peak-discovery sample represents the maximum in the preceding coarse
+    evaluation interval. Only detail rows in that interval can refine it; if
+    no returned detail sample overlaps, retain the coarse evidence and mark it
+    explicitly instead of manufacturing a timestamp or value.
+    """
+
+    refined: list[dict[str, object]] = []
+    for peak in peaks:
+        service = str(peak.get("service_name", ""))
+        coarse_timestamp = _number(peak.get("timestamp"))
+        if coarse_timestamp is None:
+            refined.append(dict(peak))
+            continue
+        candidates = [
+            row for row in _select_timestamp_observations(
+                detailed_observations.get(service, []), "operations_per_second"
+            )
+            if coarse_timestamp - max(0.0, detection_window_seconds)
+            <= float(row["timestamp_epoch"]) <= coarse_timestamp
+        ]
+        if not candidates:
+            refined.append({
+                **peak,
+                "detection_timestamp": coarse_timestamp,
+                "detection_value": peak.get("value"),
+                "timestamp_refined": False,
+                "timestamp_source": "coarse workload discovery sample; no aligned detail sample",
+            })
+            continue
+        exact = max(candidates, key=lambda row: (float(row["value"]), float(row["timestamp_epoch"])))
+        refined.append({
+            **peak,
+            "detection_timestamp": coarse_timestamp,
+            "detection_value": peak.get("value"),
+            "timestamp": float(exact["timestamp_epoch"]),
+            "value": float(exact["value"]),
+            "timestamp_refined": True,
+            "timestamp_source": "maximum returned by targeted high-resolution query",
+        })
+    return refined
+
+
+def merge_peak_detail_observations(
+    report_rows: list[dict[str, Any]],
+    detail_rows: list[dict[str, Any]],
+    detail_start_epoch: float,
+    detail_end_epoch: float,
+    metric: str,
+) -> list[dict[str, Any]]:
+    """Replace coarse observations inside a bounded peak window with detail rows.
+
+    The report-range series remains authoritative outside the targeted window.
+    Within it, only observations returned by the finer query are retained; no
+    interpolation or timestamp synthesis is performed.
+    """
+    outside = [
+        row for row in report_rows
+        if not detail_start_epoch <= float(row.get("timestamp_epoch", 0)) <= detail_end_epoch
+    ]
+    return _select_timestamp_observations(outside + list(detail_rows), metric)
 
 
 def correlate_workload_peaks(
@@ -742,7 +830,13 @@ def correlate_workload_peaks(
     for peak in peaks:
         service = str(peak["service_name"])
         ts = float(peak["timestamp"])
-        op_items = observations.get("operations_per_second", {}).get(service, [])
+        # Report-range and targeted drill-down series can contain the same
+        # timestamp. Deduplicate before constructing event/baseline anchors so
+        # a finer observation supplements evidence without weighting it twice.
+        op_items = _select_timestamp_observations(
+            observations.get("operations_per_second", {}).get(service, []),
+            "operations_per_second",
+        )
         start, end = ts - event_window_seconds, ts + event_window_seconds
         baseline_start, baseline_end = ts - event_window_seconds - baseline_window_seconds, ts - event_window_seconds
         anchors = [float(item["timestamp_epoch"]) for item in op_items if start <= float(item["timestamp_epoch"]) <= end]

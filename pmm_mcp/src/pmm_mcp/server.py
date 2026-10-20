@@ -27,8 +27,10 @@ from .performance_report import (
     extract_member_observations,
     historical_role_at_timestamp,
     infer_host_topology,
+    merge_peak_detail_observations,
     needs_host_label_fallback,
     prefer_more_complete_observations,
+    refine_workload_peak_timestamps,
     service_groups,
     summarize_member_series,
     summarize_member_observations,
@@ -36,6 +38,7 @@ from .performance_report import (
 )
 from .sampling import (
     bound_start_to_retention,
+    format_prometheus_duration,
     parse_prometheus_duration,
     resolve_utc_window,
     select_peak_drilldown_step,
@@ -231,6 +234,58 @@ def _report_metric_query(
     if not all(candidate in available_metrics for candidate in candidates):
         return " / ".join(candidates), None
     return " / ".join(candidates), expression(candidates)
+
+
+def _workload_peak_discovery_query(
+    workload_query: str, report_step: str, scrape_interval: str | None,
+) -> tuple[str | None, dict[str, object]]:
+    """Build a bounded multi-resolution screen for workload peak candidates.
+
+    The report-range query still supplies aggregate statistics. For coarser
+    grids, max_over_time evaluates that same workload expression at up to
+    one-minute resolution within each outer report interval, while retaining
+    the existing outer step and point budget. A later short query resolves the
+    exact peak timestamp.
+    """
+
+    report_seconds = parse_prometheus_duration(report_step)
+    if report_seconds <= 60:
+        return None, {
+            "status": "not_required",
+            "reason": "The report grid is already one minute or finer.",
+            "query": None,
+            "range": None,
+            "subquery_step": None,
+        }
+    scrape_seconds = None
+    if scrape_interval:
+        try:
+            scrape_seconds = parse_prometheus_duration(scrape_interval)
+        except ValueError:
+            scrape_seconds = None
+    subquery_seconds = max(60, scrape_seconds or 60)
+    subquery_step = format_prometheus_duration(subquery_seconds)
+    if subquery_seconds >= report_seconds:
+        return None, {
+            "status": "not_finer_than_scrape_interval",
+            "reason": "The exposed scrape interval is not finer than the report evaluation step.",
+            "query": None,
+            "range": report_step,
+            "subquery_step": subquery_step,
+        }
+    query = f"max_over_time(({workload_query})[{report_step}:{subquery_step}])"
+    return query, {
+        "status": "planned",
+        "reason": "Fine-resolution maximum within each coarse report interval; exact timestamp requires targeted drill-down.",
+        "query": query,
+        "range": report_step,
+        "subquery_step": subquery_step,
+        "timestamp_semantics": (
+            "Each returned timestamp is the outer evaluation time for the maximum "
+            "over the preceding report_step interval, not the timestamp of that "
+            "maximum; use returned fine-resolution samples to resolve event time."
+        ),
+    }
 
 
 def _report_role_query(
@@ -1129,6 +1184,7 @@ def generate_performance_reports(
         report["time_series_observations"] = metric_observations
         report["time_series_observations"]["replica_set_member_state"] = role_range_observations
         report["peak_drilldown_observations"] = {"cpu_used_percent": {}}
+        report["peak_correlation_detail_observations"] = {}
         report["limitations"].append(
             "Range maxima are sampled maxima of returned report-range observations, not guaranteed maxima for the entire period or instantaneous peaks; per-member coverage reports missing expected evaluation points."
         )
@@ -1146,13 +1202,57 @@ def generate_performance_reports(
                 f"The requested start predates the configured Prometheus retention of {retention}; range queries begin at query_start."
             )
         if workload_query and workload_result is not None:
-            peaks = detect_member_workload_peaks(workload_result, members)
+            step_seconds = parse_prometheus_duration(report_step)
+            peak_discovery_query, peak_discovery = _workload_peak_discovery_query(
+                workload_query, report_step, scrape_interval
+            )
+            peak_detection_result = workload_result
+            peak_discovery["report_step"] = report_step
+            peak_discovery["outer_expected_samples_per_member"] = expected_report_samples
+            peak_discovery["query_returned_samples_by_member"] = {}
+            peak_discovery["query_truncated"] = False
+            if peak_discovery_query:
+                try:
+                    discovery_result = client.prometheus_query(
+                        peak_discovery_query, query_start, period_end, report_step, 5000
+                    )
+                    discovery_data = discovery_result.get("data", {})
+                    discovery_series = discovery_data.get("result", []) if isinstance(discovery_data, dict) else []
+                    discovery_observations = extract_member_observations(
+                        discovery_result, members, "operations_per_second"
+                    )
+                    discovery_counts = {
+                        name: len({float(row["timestamp_epoch"]) for row in rows})
+                        for name, rows in discovery_observations.items()
+                    }
+                    peak_discovery["query_returned_samples_by_member"] = discovery_counts
+                    peak_discovery["query_returned_series"] = len(discovery_series) if isinstance(discovery_series, list) else 0
+                    peak_discovery["query_truncated"] = bool(discovery_data.get("truncated")) if isinstance(discovery_data, dict) else False
+                    if isinstance(discovery_series, list) and discovery_series and any(discovery_counts.values()):
+                        peak_detection_result = discovery_result
+                        peak_discovery["status"] = "available"
+                    else:
+                        peak_discovery["status"] = "no_member_samples_mapped"
+                        peak_discovery["reason"] = "The query returned no workload samples mapped to inventoried members; the report-range series remains the fallback."
+                        report["limitations"].append(
+                            "Fine-resolution workload peak discovery returned no member-mapped samples; candidate peaks use the report-range series."
+                        )
+                except PMMAPIError as exc:
+                    peak_discovery["status"] = "query_failed"
+                    peak_discovery["error"] = str(exc)
+                    report["limitations"].append(
+                        f"Fine-resolution workload peak discovery failed; candidate peaks use the report-range series: {exc}"
+                    )
+            metric_queries["operations_per_second"]["peak_discovery"] = peak_discovery
+            peaks = detect_member_workload_peaks(
+                peak_detection_result, members,
+                dedup_window_seconds=max(600, step_seconds * 2),
+            )
             scrape_seconds = None
             try:
                 scrape_seconds = parse_prometheus_duration(scrape_interval) if scrape_interval else None
             except ValueError:
                 scrape_seconds = None
-            step_seconds = parse_prometheus_duration(report_step)
             alignment_tolerance = max(step_seconds, scrape_seconds or step_seconds) / 2
             events = correlate_workload_peaks(
                 peaks,
@@ -1223,17 +1323,27 @@ def generate_performance_reports(
             member_by_name = {
                 str(member.get("service_name", "")): member for member in members
             }
+            detailed_operations_by_service: dict[str, list[dict[str, Any]]] = {}
+            detailed_correlation_observations: dict[str, dict[str, list[dict[str, Any]]]] = {}
+            correlation_detail_ranges: dict[tuple[str, str], tuple[float, float]] = {}
+            detection_window_seconds = (
+                parse_prometheus_duration(str(peak_discovery["range"]))
+                if peak_discovery.get("status") in {"available", "planned"}
+                and peak_discovery.get("range") else 7 * 60
+            )
             for peak in drilldown_peaks:
                 member_name = str(peak["service_name"])
                 member = member_by_name.get(member_name)
                 if member is None:
                     continue
                 peak_at = datetime.fromtimestamp(float(peak["timestamp"]), UTC)
-                # Keep the short query grid anchored to the workload-peak
-                # timestamp. The previous +/-7m30s bounds shifted 1m samples by
-                # 30s, making exact event observations harder to compare.
-                detail_start = max(start_at, peak_at - timedelta(minutes=7))
-                detail_end = min(end_at, peak_at + timedelta(minutes=8))
+                # A coarse discovery timestamp is the end of its evaluation
+                # interval. Include that interval plus the requested 15-minute
+                # workload baseline and five-minute event window in this
+                # bounded, member-specific fine-resolution query.
+                detail_lookback = detection_window_seconds + 15 * 60 + 5 * 60
+                detail_start = max(start_at, peak_at - timedelta(seconds=detail_lookback))
+                detail_end = min(end_at, peak_at + timedelta(minutes=5))
                 if detail_start >= detail_end:
                     continue
                 detail_source, detail_query = _report_metric_query(
@@ -1265,12 +1375,23 @@ def generate_performance_reports(
                 detail_ops = extract_member_observations(
                     detail_result, [member], "operations_per_second"
                 ).get(member_name, [])
+                detailed_operations_by_service[member_name] = detail_ops
+                refined_peak = refine_workload_peak_timestamps(
+                    [peak], {member_name: detail_ops}, detection_window_seconds
+                )[0]
+                peak.update(refined_peak)
+                peak_at = datetime.fromtimestamp(float(peak["timestamp"]), UTC)
+                correlation_detail_start = max(start_at, peak_at - timedelta(minutes=20))
+                correlation_detail_end = min(end_at, peak_at + timedelta(minutes=5))
+                correlation_detail_start_epoch = correlation_detail_start.timestamp()
+                correlation_detail_end_epoch = correlation_detail_end.timestamp()
                 cpu_detail_rows: list[dict[str, Any]] = []
                 cpu_detail_query_samples = 0
                 cpu_detail_source: str | None = None
                 cpu_detail_query: str | None = None
                 cpu_detail_fallback_query: str | None = None
                 cpu_identity = "node_id"
+                cpu_correlation_rows: list[dict[str, Any]] = []
                 cpu_summary = metric_summaries.get("cpu_used_percent", {}).get(member_name, {})
                 if parse_prometheus_duration(drilldown_step) < parse_prometheus_duration(report_step):
                     cpu_detail_source, cpu_detail_query = _report_metric_query(
@@ -1290,6 +1411,11 @@ def generate_performance_reports(
                                 cpu_detail_result, members, "cpu_used_percent"
                             )
                             cpu_detail_rows = cpu_detail_rows_by_member.get(member_name, [])
+                            cpu_correlation_rows = [
+                                row for row in cpu_detail_rows
+                                if correlation_detail_start_epoch <= float(row["timestamp_epoch"])
+                                <= correlation_detail_end_epoch
+                            ]
                             detail_expected = expected_range_samples(
                                 detail_start.astimezone(UTC).isoformat().replace("+00:00", "Z"),
                                 detail_end.astimezone(UTC).isoformat().replace("+00:00", "Z"),
@@ -1321,6 +1447,11 @@ def generate_performance_reports(
                                             "cpu_used_percent",
                                         )
                                         cpu_detail_rows = selected_cpu_rows.get(member_name, [])
+                                        cpu_correlation_rows = [
+                                            row for row in cpu_detail_rows
+                                            if correlation_detail_start_epoch <= float(row["timestamp_epoch"])
+                                            <= correlation_detail_end_epoch
+                                        ]
                                         cpu_identity = cpu_identities.get(member_name, "node_id")
                                         if cpu_detail_rows and cpu_identity == "node_name/address":
                                             cpu_detail_query = fallback_cpu_query
@@ -1382,23 +1513,33 @@ def generate_performance_reports(
                             event_row = next((item for item in events
                                               if item["service_name"] == member_name
                                               and abs(float(item["peak_timestamp_epoch"])
-                                                      - float(peak["timestamp"])) <= 1), None)
+                                                      - float(peak.get("detection_timestamp", peak["timestamp"]))) <= 1), None)
                             if event_row is None:
-                                # Correlation currently emits an ISO timestamp but
-                                # retains the epoch only in the source peak list.
                                 event_row = next((item for item in events
                                                   if item["service_name"] == member_name
-                                                  and item["peak_timestamp"] == peak_at.isoformat().replace("+00:00", "Z")), None)
+                                                  and abs(float(item["peak_timestamp_epoch"])
+                                                          - float(peak.get("detection_timestamp", peak["timestamp"]))) <= 1), None)
                             if event_row is not None:
                                 detail_evidence = attach_peak_detail_evidence(
                                     event_row, "cpu_used_percent", cpu_detail_rows,
                                     cpu_summary, drilldown_step, cpu_host_identity,
                                     expected_host_id=str(member.get("node_id") or member.get("node_name") or member.get("address") or "") or None,
-                                    workload_peak_timestamp=str(detail_summary.get("maximum_timestamp") or "") or None,
+                                    workload_peak_timestamp=peak_at.isoformat().replace("+00:00", "Z"),
                                 )
                             else:
                                 detail_evidence = None
                             report["peak_drilldown_observations"]["cpu_used_percent"][member_name] = cpu_detail_rows
+                            if cpu_correlation_rows:
+                                detailed_correlation_observations.setdefault(
+                                    "cpu_used_percent", {}
+                                )[member_name] = cpu_correlation_rows
+                                correlation_detail_ranges[("cpu_used_percent", member_name)] = (
+                                    correlation_detail_start_epoch,
+                                    correlation_detail_end_epoch,
+                                )
+                                report["peak_correlation_detail_observations"].setdefault(
+                                    "cpu_used_percent", {}
+                                )[member_name] = cpu_correlation_rows
                             metric_queries["cpu_used_percent"].setdefault("peak_drilldown", {})[member_name] = {
                                 "initial_query": cpu_initial_query,
                                 "query": cpu_detail_query,
@@ -1416,11 +1557,167 @@ def generate_performance_reports(
                         detail_evidence = None
                 else:
                     detail_evidence = None
+                if parse_prometheus_duration(drilldown_step) < parse_prometheus_duration(report_step):
+                    detail_expected = expected_range_samples(
+                        correlation_detail_start.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+                        correlation_detail_end.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+                        parse_prometheus_duration(drilldown_step),
+                    )
+                    member_host_identity = host_topology.get("by_member", {}).get(member_name, {})
+                    representative_by_metric = member_host_identity.get(
+                        "representative_service_by_metric", {}
+                    )
+                    for correlation_metric in sorted(report_metrics - {
+                        "operations_per_second", "cpu_used_percent"
+                    }):
+                        if (correlation_metric in host_metrics
+                                and representative_by_metric.get(correlation_metric)
+                                and representative_by_metric[correlation_metric] != member_name):
+                            # A shared host series is queried once, from its
+                            # representative PMM node, not copied per member.
+                            metric_queries[correlation_metric].setdefault(
+                                "peak_correlation_detail", {}
+                            )[member_name] = {
+                                "status": "reused_shared_host_series",
+                                "query_invoked": False,
+                                "reused_from_service": representative_by_metric[correlation_metric],
+                                "host_group_id": member_host_identity.get("host_group_id"),
+                                "step": drilldown_step,
+                            }
+                            continue
+                        correlation_source, correlation_query = _report_metric_query(
+                            available_metrics, correlation_metric, [member]
+                        )
+                        query_detail: dict[str, Any] = {
+                            "status": "planned" if correlation_query else "metric_unavailable",
+                            "query_invoked": False,
+                            "query": correlation_query,
+                            "fallback_query": None,
+                            "fallback_query_invoked": False,
+                            "step": drilldown_step,
+                            "expected_samples": detail_expected,
+                            "returned_samples": 0,
+                            "series_returned": 0,
+                            "query_truncated": False,
+                            "source": correlation_source,
+                            "unavailable_reason": (
+                                metric_queries.get(correlation_metric, {}).get("unavailable_reason")
+                                if correlation_query is None else None
+                            ),
+                        }
+                        if correlation_query is None:
+                            metric_queries[correlation_metric].setdefault(
+                                "peak_correlation_detail", {}
+                            )[member_name] = query_detail
+                            continue
+                        try:
+                            query_detail["query_invoked"] = True
+                            correlation_result = client.prometheus_query(
+                                correlation_query,
+                                correlation_detail_start.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+                                correlation_detail_end.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+                                drilldown_step,
+                                5000,
+                            )
+                            correlation_data = correlation_result.get("data", {})
+                            correlation_series = (
+                                correlation_data.get("result", [])
+                                if isinstance(correlation_data, dict) else []
+                            )
+                            query_detail["series_returned"] = (
+                                len(correlation_series) if isinstance(correlation_series, list) else 0
+                            )
+                            selected_rows = extract_member_observations(
+                                correlation_result, [member], correlation_metric
+                            ).get(member_name, [])
+                            if (correlation_metric in host_metrics
+                                    and (not correlation_series or needs_host_label_fallback(
+                                        {member_name: selected_rows}, detail_expected
+                                    )) and _report_node_selector([member])[0] == "node_id"):
+                                fallback_source, fallback_query = _report_metric_query(
+                                    available_metrics, correlation_metric, [member],
+                                    host_label_override="node_name",
+                                )
+                                query_detail["fallback_query"] = fallback_query
+                                if fallback_query:
+                                    try:
+                                        query_detail["fallback_query_invoked"] = True
+                                        fallback_result = client.prometheus_query(
+                                            fallback_query,
+                                            correlation_detail_start.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+                                            correlation_detail_end.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+                                            drilldown_step,
+                                            5000,
+                                        )
+                                        fallback_rows = extract_member_observations(
+                                            fallback_result, [member], correlation_metric
+                                        ).get(member_name, [])
+                                        selected, selected_identity = prefer_more_complete_observations(
+                                            {member_name: selected_rows},
+                                            {member_name: fallback_rows},
+                                            correlation_metric,
+                                        )
+                                        selected_rows = selected.get(member_name, [])
+                                        if selected_rows and "fallback" in selected_identity.get(member_name, ""):
+                                            query_detail["query"] = fallback_query
+                                            query_detail["source"] = (
+                                                f"{fallback_source} (node_name/address coverage fallback)"
+                                            )
+                                    except PMMAPIError as exc:
+                                        query_detail["fallback_error"] = str(exc)
+                            host_group = member_host_identity
+                            for row in selected_rows:
+                                row["query_step"] = drilldown_step
+                                row["query_source"] = "peak_correlation_detail"
+                                if correlation_metric in host_metrics:
+                                    row["host_group_id"] = host_group.get("host_group_id")
+                                    row["physical_host_id"] = host_group.get("host_group_id")
+                                    row["host_shared"] = bool(host_group.get("shared_host"))
+                                    row["host_members"] = host_group.get("host_members", [member_name])
+                                    row["measurement_scope"] = (
+                                        "shared_host" if host_group.get("shared_host")
+                                        else "PMM-inventoried node; physical-host uniqueness unverified"
+                                    )
+                                    row["physical_identity_confidence"] = host_group.get(
+                                        "physical_identity_confidence"
+                                    )
+                            query_detail["returned_samples"] = len(selected_rows)
+                            query_detail["query_truncated"] = bool(
+                                correlation_data.get("truncated")
+                            ) if isinstance(correlation_data, dict) else False
+                            query_detail["status"] = (
+                                "available" if selected_rows
+                                else "no_member_samples_mapped" if correlation_series
+                                else "no_series_returned"
+                            )
+                            if selected_rows:
+                                detailed_correlation_observations.setdefault(
+                                    correlation_metric, {}
+                                )[member_name] = selected_rows
+                                correlation_detail_ranges[(correlation_metric, member_name)] = (
+                                    correlation_detail_start_epoch,
+                                    correlation_detail_end_epoch,
+                                )
+                                report["peak_correlation_detail_observations"].setdefault(
+                                    correlation_metric, {}
+                                )[member_name] = selected_rows
+                        except PMMAPIError as exc:
+                            query_detail["status"] = "query_failed"
+                            query_detail["error"] = str(exc)
+                        metric_queries[correlation_metric].setdefault(
+                            "peak_correlation_detail", {}
+                        )[member_name] = query_detail
                 drilldowns.append({
                     "service_name": member_name,
                     "status": "available" if detail_summary.get("samples", 0) else "unavailable",
                     "peak_time": peak_at.isoformat().replace("+00:00", "Z"),
+                    "candidate_evaluation_time": datetime.fromtimestamp(
+                        float(peak.get("detection_timestamp", peak["timestamp"])), UTC
+                    ).isoformat().replace("+00:00", "Z"),
                     "detected_peak_ops_per_second": peak["value"],
+                    "coarse_discovery_value": peak.get("detection_value"),
+                    "timestamp_refined": bool(peak.get("timestamp_refined", False)),
+                    "timestamp_source": peak.get("timestamp_source", "report-range sample"),
                     "peak_detection_samples": peak["samples"],
                     "window": {
                         "start": detail_start.astimezone(UTC).isoformat().replace("+00:00", "Z"),
@@ -1434,11 +1731,81 @@ def generate_performance_reports(
                     "metric_source": detail_source,
                     "cpu_peak_detail": detail_evidence,
                 })
+            # Re-run correlation around the finer sampled maxima. The detailed
+            # workload rows are used only as event/baseline anchors; report-range
+            # aggregates and their coverage remain unchanged.
+            cpu_evidence_by_peak: dict[tuple[str, str], dict[str, Any]] = {}
+            for prior_event in events:
+                cpu_row = prior_event.get("correlated_metrics", {}).get("cpu_used_percent", {})
+                evidence = cpu_row.get("peak_drilldown") if isinstance(cpu_row, dict) else None
+                if isinstance(evidence, dict) and evidence.get("workload_peak_timestamp"):
+                    cpu_evidence_by_peak[(str(prior_event["service_name"]), str(evidence["workload_peak_timestamp"]))] = evidence
+            correlation_observations = {
+                metric: {service: list(rows) for service, rows in data.items()}
+                for metric, data in metric_observations.items()
+                if metric != "replica_set_member_state"
+            }
+            for service, rows in detailed_operations_by_service.items():
+                correlation_observations.setdefault("operations_per_second", {}).setdefault(service, []).extend(rows)
+            for metric, services_with_detail in detailed_correlation_observations.items():
+                for service, detail_rows in services_with_detail.items():
+                    detail_start_epoch, detail_end_epoch = correlation_detail_ranges[(metric, service)]
+                    base_rows = correlation_observations.setdefault(metric, {}).setdefault(service, [])
+                    correlation_observations[metric][service] = merge_peak_detail_observations(
+                        base_rows, detail_rows, detail_start_epoch, detail_end_epoch, metric
+                    )
+            refined_events = correlate_workload_peaks(
+                peaks, correlation_observations, members,
+                alignment_tolerance_seconds=alignment_tolerance,
+                host_identity_by_member=host_topology.get("by_member", {}),
+            )
+            for event in refined_events:
+                event_key = (str(event["service_name"]), str(event["peak_timestamp"]))
+                cpu_evidence = cpu_evidence_by_peak.get(event_key)
+                if cpu_evidence:
+                    event["correlated_metrics"].setdefault("cpu_used_percent", {})["peak_drilldown"] = cpu_evidence
+                event_timestamp = float(event["peak_timestamp_epoch"])
+                role_samples = [
+                    item for item in role_range_observations.get(str(event["service_name"]), [])
+                    if abs(float(item["timestamp_epoch"]) - event_timestamp) <= alignment_tolerance
+                ]
+                historical_role = historical_role_at_timestamp(role_samples, event_timestamp, alignment_tolerance)
+                event["member_role_at_peak"] = historical_role
+                repl = event["correlated_metrics"].get("replication_lag_seconds")
+                if historical_role["status"] == "primary" and repl is not None:
+                    repl.update({
+                        "status": "not_applicable_primary", "event_samples": 0,
+                        "event_mean": None, "event_min": None, "event_max": None,
+                        "baseline_samples": 0, "baseline_mean": None,
+                        "expected_baseline_samples": 0, "missing_baseline_samples": 0,
+                        "baseline_coverage_percent": None, "change_percent": None,
+                        "timestamps": [],
+                        "assessment": "The exporter lag series describes member lag relative to the replica-set primary; a primary's self-lag is not a valid replication-lag indicator.",
+                    })
+                    if "replication_lag_seconds (not semantically applicable to primary)" not in event["missing_evidence"]:
+                        event["missing_evidence"].append("replication_lag_seconds (not semantically applicable to primary)")
+                elif historical_role["status"] != "secondary" and repl is not None:
+                    repl.update({
+                        "status": "role_unknown_at_peak", "event_samples": 0,
+                        "event_mean": None, "event_min": None, "event_max": None,
+                        "assessment": "Historical member role is unavailable or conflicting at this peak, so replication lag cannot be interpreted for this event.",
+                    })
+                    if "replication_lag_seconds (member role unavailable or conflicting at peak)" not in event["missing_evidence"]:
+                        event["missing_evidence"].append("replication_lag_seconds (member role unavailable or conflicting at peak)")
+            events = refined_events
+            report["sections"]["workload_peak_analysis_and_metric_correlation"]["events"] = events
+            report["sections"]["workload_peak_analysis_and_metric_correlation"]["window"] = {
+                "before_seconds": 300, "after_seconds": 300,
+                "alignment_tolerance_seconds": alignment_tolerance,
+                "baseline_seconds": 900,
+                "peak_discovery": peak_discovery,
+            }
             report["sections"]["workload_and_concurrency"]["peak_drilldown"] = {
                 "status": "available" if any(item["status"] == "available" for item in drilldowns)
                 else "unavailable" if peaks else "no_detected_peak",
-                "trigger": "one sampled maximum per member receives the existing finer drill-down; up to two additional distinct candidates are correlated using the one-minute range series",
+                "trigger": "one sampled maximum per member receives bounded multi-resolution discovery and a targeted fine-resolution query; exact timestamps come only from returned detail samples",
                 "step": drilldown_step,
+                "discovery": peak_discovery,
                 "windows": drilldowns,
             }
         reports.append(report)

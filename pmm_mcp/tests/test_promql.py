@@ -9,7 +9,12 @@ from pmm_mcp.performance_report import (
     summarize_member_role_series,
 )
 from pmm_mcp.workload_comparison import compare_summaries, summarize_range_result
-from pmm_mcp.server import _report_metric_query, _report_role_query, _report_selector
+from pmm_mcp.server import (
+    _report_metric_query,
+    _report_role_query,
+    _report_selector,
+    _workload_peak_discovery_query,
+)
 from pmm_mcp.report_validation import validate_performance_report
 
 
@@ -22,6 +27,21 @@ class PromQLTests(unittest.TestCase):
             validate_promql("")
         with self.assertRaises(ValueError):
             validate_promql("up; drop")
+
+    def test_workload_peak_discovery_uses_bounded_finer_subquery(self) -> None:
+        base = 'sum by (service_name) (rate(mongodb_op_counters_total{service_name="orders"}[5m]))'
+        query, detail = _workload_peak_discovery_query(base, "15m", "1m")
+        self.assertEqual(query, f"max_over_time(({base})[15m:1m])")
+        self.assertEqual(detail["status"], "planned")
+        self.assertEqual(detail["range"], "15m")
+        self.assertEqual(detail["subquery_step"], "1m")
+        self.assertIn("not the timestamp of that maximum", detail["timestamp_semantics"])
+        validate_promql(query or "")
+
+    def test_peak_discovery_respects_scrape_cadence(self) -> None:
+        query, detail = _workload_peak_discovery_query("rate(ops_total[5m])", "5m", "5m")
+        self.assertIsNone(query)
+        self.assertEqual(detail["status"], "not_finer_than_scrape_interval")
 
     def test_summarizes_and_compares_range_values(self) -> None:
         result = {"data": {"result": [
