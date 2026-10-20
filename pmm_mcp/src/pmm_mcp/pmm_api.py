@@ -12,6 +12,7 @@ from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 from .config import PMMClientConfig
+from .sampling import format_prometheus_duration, parse_prometheus_duration
 from .service_discovery import merge_mongodb_inventory, mongodb_services
 
 
@@ -133,6 +134,77 @@ class PMMClient:
             needle = search.lower()
             normalized = [value for value in normalized if needle in value.lower()]
         return sorted(normalized)[: max(1, min(limit, 50000))]
+
+    def prometheus_scrape_interval(self, members: list[dict[str, Any]]) -> str | None:
+        """Return the slowest active scrape interval for report member targets, if exposed."""
+
+        payload = self._json_value(
+            f"{self.config.base_url}/prometheus/api/v1/targets?state=active"
+        )
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        targets = data.get("activeTargets", []) if isinstance(data, dict) else []
+        identifiers = {
+            str(member.get(key, ""))
+            for member in members
+            for key in ("service_name", "node_id", "node_name", "address")
+            if member.get(key)
+        }
+        intervals: list[float] = []
+        if not isinstance(targets, list):
+            return None
+        for target in targets:
+            if not isinstance(target, dict):
+                continue
+            labels = target.get("labels", {})
+            discovered = target.get("discoveredLabels", {})
+            target_values = {
+                str(value)
+                for label_set in (labels, discovered)
+                if isinstance(label_set, dict)
+                for value in label_set.values()
+                if value is not None
+            }
+            if identifiers and not identifiers.intersection(target_values):
+                continue
+            interval = target.get("scrapeInterval")
+            if not isinstance(interval, str):
+                # Prometheus may expose the configured cadence as a
+                # discovered relabel instead of a top-level field.
+                interval = next(
+                    (
+                        discovered.get(label)
+                        for label in ("__scrape_interval__", "scrape_interval")
+                        if isinstance(discovered.get(label), str)
+                    ),
+                    None,
+                )
+            if not isinstance(interval, str):
+                continue
+            try:
+                seconds = parse_prometheus_duration(interval)
+            except ValueError:
+                continue
+            intervals.append(seconds)
+        if not intervals:
+            return None
+        return format_prometheus_duration(max(intervals))
+
+    def prometheus_retention(self) -> str | None:
+        """Return configured Prometheus time retention when the status API exposes it."""
+
+        payload = self._json_value(
+            f"{self.config.base_url}/prometheus/api/v1/status/flags"
+        )
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        if not isinstance(data, dict):
+            return None
+        raw = data.get("storage.tsdb.retention.time") or data.get("retention.time")
+        if not isinstance(raw, str):
+            return None
+        try:
+            return format_prometheus_duration(parse_prometheus_duration(raw))
+        except ValueError:
+            return None
 
     def prometheus_query(
         self,

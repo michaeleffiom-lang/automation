@@ -84,6 +84,10 @@ class PromQLTests(unittest.TestCase):
         cpu_source, cpu_query = _report_metric_query(
             {"node_cpu_seconds_total"}, "cpu_used_percent", members
         )
+        fallback_cpu_source, fallback_cpu_query = _report_metric_query(
+            {"node_cpu_seconds_total"}, "cpu_used_percent", members,
+            host_label_override="node_name",
+        )
         filesystem_source, filesystem_query = _report_metric_query(
             {"node_filesystem_avail_bytes", "node_filesystem_size_bytes"},
             "root_filesystem_used_percent",
@@ -91,14 +95,79 @@ class PromQLTests(unittest.TestCase):
         )
         self.assertEqual(cpu_source, "node_cpu_seconds_total")
         self.assertIn('node_id=~"^(node-1|node-2)$"', cpu_query)
-        self.assertIn("avg by (node_id)", cpu_query)
+        self.assertIn("avg by (node_id,node_name,instance,job,agent_id,node_type)", cpu_query)
         self.assertNotIn("service_name", cpu_query)
         validate_promql(cpu_query)
+        self.assertEqual(fallback_cpu_source, "node_cpu_seconds_total")
+        self.assertIn('node_name=~"^(mongodb7-rs1|mongodb7-rs2)$"', fallback_cpu_query)
+        self.assertIn("avg by (node_id,node_name,instance,job,agent_id,node_type)", fallback_cpu_query)
+        self.assertEqual(cpu_query.split("rate(", 1)[1].split("[", 1)[1],
+                         fallback_cpu_query.split("rate(", 1)[1].split("[", 1)[1])
+        validate_promql(fallback_cpu_query)
         self.assertIn("mountpoint=\"/\"", filesystem_query)
-        self.assertIn("max by (node_id)", filesystem_query)
+        self.assertIn("max by (node_id,node_name,instance,job,agent_id,node_type,mountpoint,device,fstype)", filesystem_query)
         self.assertIn("node_id=~\"^(node-1|node-2)$\"", filesystem_query)
         self.assertIn("node_filesystem_avail_bytes / node_filesystem_size_bytes", filesystem_source)
         validate_promql(filesystem_query)
+
+    def test_disk_metrics_keep_device_provenance_and_avoid_stacked_device_sums(self) -> None:
+        members = [{"service_name": "mongo-a", "node_id": "node-1", "address": "host-a"}]
+        available = {
+            "node_disk_reads_completed_total", "node_disk_writes_completed_total",
+            "node_disk_read_time_seconds_total", "node_disk_write_time_seconds_total",
+        }
+        for metric in ("disk_iops", "disk_read_iops", "disk_write_iops",
+                       "disk_io_latency_seconds", "disk_read_latency_seconds",
+                       "disk_write_latency_seconds"):
+            source, query = _report_metric_query(available, metric, members)
+            self.assertIsNotNone(source)
+            self.assertIn("device)", query)
+            self.assertIn("node_id", query)
+            if metric.endswith("iops") or metric == "disk_iops":
+                self.assertIn("rate(", query)
+                self.assertNotIn("sum by (node_id,node_name,instance,job,agent_id,node_type)", query)
+            validate_promql(query)
+
+        _, operation_latency = _report_metric_query(
+            {"mongodb_mongod_op_latencies_latency_total", "mongodb_mongod_op_latencies_ops_total"},
+            "operation_latency_seconds", members,
+        )
+        self.assertIn("rate(mongodb_mongod_op_latencies_latency_total", operation_latency)
+        self.assertIn("rate(mongodb_mongod_op_latencies_ops_total", operation_latency)
+        self.assertIn("/ 1000000", operation_latency)
+        validate_promql(operation_latency)
+
+    def test_missing_source_metric_does_not_create_a_fabricated_query(self) -> None:
+        source, query = _report_metric_query(
+            set(), "disk_read_iops", [{"service_name": "mongo-a", "node_id": "node-1"}]
+        )
+        self.assertEqual(source, "node_disk_reads_completed_total")
+        self.assertIsNone(query)
+
+    def test_report_sections_expose_restored_resource_storage_and_latency_metrics(self) -> None:
+        metrics = {
+            name: {"mongo-a": {"status": "ok", "samples": 3}}
+            for name in (
+                "cpu_used_percent", "memory_used_percent", "root_filesystem_used_percent",
+                "disk_read_iops", "disk_write_iops", "disk_read_latency_seconds",
+                "disk_write_latency_seconds", "wiredtiger_cache_used_percent",
+                "wiredtiger_evictions_per_second", "operation_latency_seconds",
+            )
+        }
+        report = build_replica_set_report(
+            "orders", "rs0", [{"service_name": "mongo-a"}], metrics,
+            {"cpu_used_percent": 80, "root_filesystem_used_percent": 80,
+                "connection_used_percent": 60, "wiredtiger_dirty_page_percent": 20},
+        )
+        resources = report["sections"]["resources_and_capacity"]["metrics"]
+        storage = report["sections"]["mongodb_storage_engine_health"]["metrics"]
+        workload = report["sections"]["workload_and_concurrency"]["metrics"]
+        self.assertIn("memory_used_percent", resources)
+        self.assertIn("disk_read_iops", resources)
+        self.assertIn("disk_write_latency_seconds", resources)
+        self.assertIn("wiredtiger_cache_used_percent", storage)
+        self.assertIn("wiredtiger_evictions_per_second", storage)
+        self.assertIn("operation_latency_seconds", workload)
 
     def test_wiredtiger_dirty_percentage_uses_available_server_status_metrics(self) -> None:
         members = [{"service_name": "mflix-rs", "node_id": "node-1"}]
@@ -115,7 +184,7 @@ class PromQLTests(unittest.TestCase):
             "mongodb_ss_wt_cache_tracked_dirty_bytes_in_the_cache / "
             "mongodb_mongod_wiredtiger_cache_max_bytes",
         )
-        self.assertIn("100 * max by (service_name)", query)
+        self.assertIn("100 * max by (service_name,node_id,node_name,instance,job,agent_id,service_id)", query)
         self.assertIn("mongodb_ss_wt_cache_tracked_dirty_bytes_in_the_cache", query)
         self.assertIn("mongodb_mongod_wiredtiger_cache_max_bytes", query)
         validate_promql(query)
